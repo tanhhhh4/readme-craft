@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+.readme-craft.yml
+.readme-craft.yaml
+.readme-craft/
+*.log

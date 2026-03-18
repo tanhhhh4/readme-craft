@@ -1,0 +1,39 @@
+{
+  "name": "readme-craft",
+  "version": "0.1.0",
+  "description": "AI-assisted README generator with progressive project comprehension",
+  "type": "module",
+  "bin": {
+    "readme-craft": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli/index.ts",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "readme",
+    "cli",
+    "openai",
+    "typescript"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.79.0",
+    "commander": "^14.0.0",
+    "dotenv": "^17.3.1",
+    "inquirer": "^12.9.6",
+    "js-yaml": "^4.1.0",
+    "openai": "^5.12.2",
+    "simple-git": "^3.28.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}

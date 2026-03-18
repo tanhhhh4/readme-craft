@@ -1,0 +1,8 @@
+model:
+  provider: openai          # openai 或 anthropic
+  model: gpt-4o-mini        # 模型名称
+  # apiKey: env:OPENAI_API_KEY  # 通过 env: 前缀引用环境变量，或直接设置环境变量 OPENAI_API_KEY
+  # baseUrl: https://your-proxy.example.com  # 可选，自定义 API 端点
+language: zh
+outputFile: README.md
+maxRegenerationAttempts: 2
