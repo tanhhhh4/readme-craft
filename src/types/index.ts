@@ -52,6 +52,8 @@ export interface ProjectContext {
   hotFiles: string[];
   routeEndpoints: string[];
   configurationFiles: string[];
+  cliHelpOutput?: string;
+  mermaidDiagram?: string;
 }
 
 export interface ProjectUnderstanding {
@@ -134,9 +136,9 @@ export interface InitOptions {
 
 export interface Snapshot {
   generatedAt: string;
-  projectContext: ProjectContext;
-  projectUnderstanding: ProjectUnderstanding;
-  insights: InsightsResult;
-  outline: PlannedOutline;
-  readmePath: string;
+  dependencies: Record<string, string>;
+  srcFiles: string[];
+  binEntries: Record<string, string>;
+  scripts: Record<string, string>;
+  license: string;
 }

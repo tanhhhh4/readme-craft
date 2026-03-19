@@ -23,6 +23,7 @@ export async function buildSectionPrompt(
     `用 ${language} 直接撰写 README 的「${section.title}」章节。`,
     "只输出可直接放进 README 的 Markdown，不要解释你的思路，不要重复项目标题。",
     "禁止空洞形容词和 AI 套话。像项目作者一样写，优先写具体命令、文件、模块、限制、数据流和设计取舍。",
+    "在适合折叠次要信息的地方，直接使用 HTML `<details>` 和 `<summary>` 标签，不要改写成伪代码或解释说明。",
     ...sectionRequirements,
     "如果上下文不足，明确写出能确认的范围，不要脑补。",
     JSON.stringify(sectionContext, null, 2)
@@ -68,6 +69,7 @@ async function buildSectionContext(
         scripts: context.scripts,
         entryPoints: context.entryPoints,
         binCommands: await collectBinCommands(context),
+        cliHelpOutput: context.cliHelpOutput,
         configExamples: await loadSourceSnippets(context, context.configurationFiles, 3, 120)
       };
     case "usage":
@@ -75,6 +77,7 @@ async function buildSectionContext(
         ...baseContext,
         scripts: context.scripts,
         binCommands: await collectBinCommands(context),
+        cliHelpOutput: context.cliHelpOutput,
         entrySourceSnippets: await loadSourceSnippets(context, context.entryPoints, 3, 120),
         coreModules: context.coreModules.slice(0, 6)
       };
@@ -134,14 +137,26 @@ function buildSectionRequirements(section: OutlineSection, context: ProjectConte
       "只写真实可运行的命令，必须优先使用项目实际存在的 package scripts、bin 名称和入口命令。",
       "禁止出现占位符仓库地址或示例项目名，例如 `your-org`、`your-username`、`example-repo`、`your-project`。",
       "只有在上下文里能明确确认远程仓库地址时，才可以写 `git clone`；如果无法确认远程仓库地址，就不要写 `git clone`，改写为基于当前本地源码目录的安装或运行方式。",
-      "说明最低运行环境、安装步骤、构建/开发/检查命令，以及一个最短可跑通的使用命令。",
-      "如果项目缺失发布或安装信息，明确写出当前仓库内能确认的运行方式。"
+      "正文外层只保留最推荐的一种安装或运行方式，总命令数控制在 3-5 行，覆盖安装/启动/检查或一个最短可跑通的使用命令。",
+      "最低运行环境用一行内联文字说明，不要单独起子标题。",
+      "如果还存在 npm global、源码安装、docker 等其他方式，把它们放进 `<details><summary>其他安装方式</summary>` 折叠块。",
+      "如果项目缺失发布或安装信息，明确写出当前仓库内能确认的运行方式。",
+      ...(context.cliHelpOutput
+        ? [
+            "如果上下文提供了 `cliHelpOutput`，必须加入“以下为实际 CLI 输出”说明，并把原始 help 输出放进代码块。"
+          ]
+        : [])
     ],
     usage: [
       "以 `## 使用示例` 开头。",
       "围绕最核心的工作流给出真实输入输出示例，而不是罗列参数说明。",
       "至少包含一个命令或代码块，示例中的命令必须和当前项目脚本、bin、入口逻辑一致。",
-      "如果无法确认完整输出，给出基于代码可确认的输入和结果范围。"
+      "如果无法确认完整输出，给出基于代码可确认的输入和结果范围。",
+      ...(context.cliHelpOutput
+        ? [
+            "如果上下文提供了 `cliHelpOutput`，必须加入“以下为实际 CLI 输出”说明，并把原始 help 输出放进代码块。"
+          ]
+        : [])
     ],
     api: [
       "以 `## API 文档` 开头。",
@@ -155,16 +170,20 @@ function buildSectionRequirements(section: OutlineSection, context: ProjectConte
     ],
     structure: [
       "以 `## 项目结构` 开头。",
-      "不要只贴目录树；先给一个简短的数据流说明，再解释关键目录和模块如何串起来。",
+      "不要只贴目录树；先给一个简短的数据流或模块关系说明，再解释关键目录和模块如何串起来。",
+      "目录树必须放进 `<details><summary>完整目录结构</summary>` 折叠块里，折叠块外不要重复整棵树。",
       "明确指出至少 3 个核心模块及其调用关系或职责边界。"
     ],
     "tech-stack": [
       "以 `## 技术栈` 开头。",
       "基于完整依赖列表归纳运行时依赖、开发工具和这些技术各自承担的职责。",
+      "如果要列依赖表格，必须放进 `<details><summary>依赖清单</summary>` 折叠块。",
       "不要只点名框架，要写出它们在当前项目里的用途。"
     ],
     contributing: [
       "以 `## 贡献指南` 开头。",
+      "先在折叠块外给出简短的贡献入口和基本质量要求。",
+      "详细的开发流程、提交流程或命令清单放进 `<details><summary>开发流程细节</summary>` 折叠块。",
       "结合真实 scripts 给出开发、检查、构建建议。",
       "如果仓库没有测试命令，不要假装有，直接说明当前只有哪些质量门槛。"
     ],

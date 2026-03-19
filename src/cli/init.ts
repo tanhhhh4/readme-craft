@@ -3,14 +3,17 @@ import path from "node:path";
 import { createAIProvider } from "../ai/index.js";
 import { buildProjectUnderstanding } from "../comprehension/index.js";
 import { generateReadmeSections } from "../generator/index.js";
+import { generateMermaidDiagram } from "../generator/mermaid.js";
 import { buildProjectInsights } from "../insights/index.js";
 import { planReadmeOutline } from "../planner/index.js";
+import { captureCliHelp } from "../scanner/cli-output.js";
 import { scanProject } from "../scanner/index.js";
-import type { InitOptions, Snapshot } from "../types/index.js";
+import type { InitOptions } from "../types/index.js";
 import { loadConfig } from "../utils/config.js";
 import { ensureDir, writeText } from "../utils/fs.js";
 import { log } from "../utils/log.js";
 import { previewMarkdown, renderReadme } from "../utils/markdown.js";
+import { buildSnapshot, saveSnapshot } from "../utils/snapshot.js";
 
 export async function runInitCommand(options: InitOptions): Promise<void> {
   const config = await loadConfig(options);
@@ -20,6 +23,12 @@ export async function runInitCommand(options: InitOptions): Promise<void> {
   log.step(`Scanning project: ${targetDir}`);
   const projectContext = await scanProject(targetDir);
   log.success(`Detected ${projectContext.language} ${projectContext.projectType} project`);
+
+  const cliHelpOutput = await captureCliHelp(projectContext);
+  if (cliHelpOutput) {
+    projectContext.cliHelpOutput = cliHelpOutput;
+    log.success("Captured live CLI help output");
+  }
 
   log.step(`Building project understanding with ${config.model.provider}/${config.model.model}`);
   const provider = createAIProvider(config);
@@ -33,6 +42,18 @@ export async function runInitCommand(options: InitOptions): Promise<void> {
   log.step("Extracting project insights");
   const insights = await buildProjectInsights(provider, projectContext, projectUnderstanding, config.language);
   log.success("Project insights complete");
+
+  try {
+    projectContext.mermaidDiagram = await generateMermaidDiagram(
+      provider,
+      projectContext,
+      projectUnderstanding,
+      insights
+    );
+    log.success("Generated Mermaid architecture diagram");
+  } catch {
+    delete projectContext.mermaidDiagram;
+  }
 
   log.step("Planning README outline");
   const outline = await planReadmeOutline(projectContext, projectUnderstanding, options.yes === true);
@@ -83,20 +104,13 @@ export async function runInitCommand(options: InitOptions): Promise<void> {
   }
 
   await writeText(outputPath, markdown);
-  await saveSnapshot(targetDir, outputPath, {
-    generatedAt: new Date().toISOString(),
-    projectContext,
-    projectUnderstanding,
-    insights,
-    outline,
-    readmePath: outputPath
-  });
+  await saveSnapshot(targetDir, await buildSnapshot(projectContext));
+  await saveLastOutput(targetDir, outputPath);
   log.success(`README written to ${outputPath}`);
 }
 
-async function saveSnapshot(targetDir: string, outputPath: string, snapshot: Snapshot): Promise<void> {
+async function saveLastOutput(targetDir: string, outputPath: string): Promise<void> {
   const metadataDir = path.join(targetDir, ".readme-craft");
   await ensureDir(metadataDir);
-  await writeText(path.join(metadataDir, "snapshot.json"), JSON.stringify(snapshot, null, 2));
   await writeText(path.join(metadataDir, "last-output.txt"), outputPath);
 }
