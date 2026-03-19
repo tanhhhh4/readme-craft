@@ -19,14 +19,46 @@ export async function generateMermaidDiagram(
           "Generate a Mermaid flowchart for this project.",
           "Requirements:",
           "- Base it on the provided modules, entry points, and dependencies.",
-          "- Use `flowchart LR`.",
+          "- Use `flowchart TD`.",
+          "- You must group modules into `subgraph` blocks by logical layers.",
+          `- Use ${context.language === "zh" ? "Chinese" : "English"} subgraph titles.`,
+          "- Recommended grouping pattern:",
+          (context.language === "zh"
+            ? "  - 入口层 (CLI commands or entry points)"
+            : "  - Entry Layer (CLI commands or entry points)"),
+          (context.language === "zh"
+            ? "  - 扫描层 (scanner, cli-output, file discovery)"
+            : "  - Scanning Layer (scanner, cli-output, file discovery)"),
+          (context.language === "zh"
+            ? "  - 理解层 (comprehension, insights, analysis)"
+            : "  - Understanding Layer (comprehension, insights, analysis)"),
+          (context.language === "zh"
+            ? "  - 规划层 (planner)"
+            : "  - Planning Layer (planner)"),
+          (context.language === "zh"
+            ? "  - 生成层 (generator, sections, mermaid)"
+            : "  - Generation Layer (generator, sections, mermaid)"),
+          (context.language === "zh"
+            ? "  - 审查层 (reviewer, rules, validation)"
+            : "  - Review Layer (reviewer, rules, validation)"),
+          (context.language === "zh"
+            ? "  - AI 层 (providers, model adapters)"
+            : "  - AI Layer (providers, model adapters)"),
+          "- Only include groups that actually exist in the project.",
+          "- Each subgraph should contain real file/module nodes from the project context.",
+          "- Inside a subgraph, you may connect related nodes.",
+          "- Between subgraphs, draw only the main data flow.",
+          "- Inter-subgraph edges must connect only from the previous group's exit node to the next group's entry node.",
+          "- Do not connect every node to every other node across groups.",
           "- Keep it concise: at most 15 nodes.",
           "- Use real file names or module names from the context. Do not invent generic labels like Backend, Service, Processor, or Main Module unless they already exist.",
+          "- Prefer the smallest set of nodes that still explains the true module flow.",
           "- Output pure Mermaid code only. No markdown fences. No explanation.",
           JSON.stringify(
             {
               project: {
                 name: context.name,
+                language: context.language,
                 projectType: context.projectType,
                 entryPoints: context.entryPoints,
                 coreModules: context.coreModules.slice(0, 12),
@@ -65,14 +97,19 @@ function isValidMermaid(diagram: string): boolean {
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  if (lines.length < 2 || lines[0] !== "flowchart LR") {
+  if (lines.length < 2 || lines[0] !== "flowchart TD") {
     return false;
   }
 
   const nodeIds = new Set<string>();
+  let subgraphCount = 0;
   for (const line of lines.slice(1)) {
     if (line.startsWith("%%")) {
       continue;
+    }
+
+    if (line.startsWith("subgraph ")) {
+      subgraphCount += 1;
     }
 
     const matches = line.matchAll(/\b([A-Za-z][A-Za-z0-9_]*)\s*(?:\[[^\]]+\]|\([^)]+\)|\{[^}]+\})?/g);
@@ -84,7 +121,7 @@ function isValidMermaid(diagram: string): boolean {
     }
   }
 
-  return nodeIds.size > 0 && nodeIds.size <= 15;
+  return subgraphCount > 0 && nodeIds.size > 0 && nodeIds.size <= 15;
 }
 
 function isMermaidKeyword(value: string): boolean {
