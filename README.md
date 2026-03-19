@@ -1,5 +1,5 @@
 <h1 align="center">readme-craft</h1>
-<p align="center">基于 AI 的 README 文档自动生成 CLI 工具，通过渐进式项目理解实现结构化文档的全量生成与增量更新（readme-craft）</p>
+<p align="center">基于 LLM 的 CLI 工具，自动分析代码仓库并生成高质量 README 文档。</p>
 <p align="center"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg" />
   <img alt="Node Version" src="https://img.shields.io/badge/node-%3E%3D18.17.0-339933.svg" />
   <img alt="TypeScript" src="https://img.shields.io/badge/language-TypeScript-3178C6.svg" /></p>
@@ -19,95 +19,68 @@
 
 ## 项目简介
 
-readme-craft 是一个 CLI 工具，通过五阶段流水线从项目源码生成结构化 README，支持全量生成（`init`）和基于快照差异的增量更新（`update`）。
+readme-craft 是一个基于 LLM 的 CLI 工具，通过五阶段管道从项目源码生成结构化 README，支持全量生成和基于快照差异的增量更新。
 
-直接让 AI 一次性生成 README 的常见问题是：AI 拿到的上下文太浅，产出内容要么空泛要么带占位符（`your-org`、`TBD`），和实际代码脱节。readme-craft 把这个过程拆成五个串行阶段，每阶段的输出喂给下一阶段，逐步加深对项目的理解：`scanProject` 扫描目录结构、入口点、核心模块和配置文件 → `buildProjectUnderstanding` 以 `temperature=0.1` 提取七维结构化理解并做两轮精炼 → `buildProjectInsights` 从入口、热文件、核心模块中采集最多 8 个代码片段作为证据 → `planReadmeOutline` 动态规划章节（通过 inquirer checkbox 交互确认，或 `-y` 跳过）→ `generateReadmeSections` 逐节生成内容并经过双重质量审查循环。
+把项目信息一股脑丢给 AI 让它一次性写 README，常见结果是：内容空泛、占位符残留（`your-org`、`TBD`）、和实际代码脱节。根本原因是单次调用的上下文太浅——模型既要理解项目又要组织文档，两件事挤在一个 prompt 里，哪件都做不好。
 
-质量门控是区别于一次性生成的关键机制。每个章节生成后，`reviewSectionQuality`（`src/reviewer/index.ts`）先执行 6 项确定性规则检查——安装步骤是否存在、命令是否可运行、是否包含代码示例、链接格式是否合法、徽章语法是否正确、是否残留占位符（通过 `/\[TODO\]|\bTBD\b|your-org|your-username/i` 正则匹配）——再由 AI 从 clarity、completeness、accuracy、actionability 四个维度打分，最终按 `overallScore = AI均分 × 0.8 + 规则通过率 × 0.2` 加权合成。不达标的章节会携带上一轮的 `quality.issues` 作为中文反馈注入 prompt 自动重写，最多重试 `maxRegenerationAttempts` 轮。
+readme-craft 把这个过程拆成五个串行阶段，每阶段的类型化 JSON 输出喂给下一阶段，逐步加深理解：
 
-`update` 命令不会全量重新生成。它通过 `buildSnapshot`/`readSnapshot` 生成项目快照，`detectChangedSections`（`src/cli/update.ts`）比对前后快照差异并映射到章节 ID，只对变更章节重新走生成+审查流程，再由 `mergeReadmeSections` 合并回现有文档。这意味着首次 `readme-craft init`，后续代码变更后只需 `readme-craft update`，未变更章节保持不动。
+1. `scanProject` 扫描目录结构、入口点、核心模块、热文件和配置文件，构建 `ProjectContext`
+2. `buildProjectUnderstanding`（temperature 0.1）读取实际入口源码，提取七维结构化理解，经 `normalizeUnderstanding` 校验修正
+3. `buildProjectInsights`（temperature 0.15）从 entryPoints / hotFiles / coreModules / configurationFiles 四个来源去重后取前 8 个文件、截取前 80 行作为代码证据
+4. `planReadmeOutline` 根据项目特征动态组装章节（`routeEndpoints` 非空时追加 API 章节，`configurationFiles` 存在时追加配置章节），支持 inquirer checkbox 交互选择或 `-y` 跳过
+5. `generateReadmeSections` 逐节生成内容，每节经 `reviewSectionQuality` 双轨审查后决定是否重写
+
+和一次性生成的核心区别在质量门控机制。`src/reviewer/index.ts` 中，每个章节生成后先走 `runRuleChecks`——6 项确定性布尔检查（安装步骤存在性、命令可运行性、代码示例、链接格式、徽章语法、占位符拦截，其中占位符通过 `/\[TODO\]|\bTBD\b|your-org|your-username|example-repo/i` 正则匹配），再走 `runAIReview` 四维评分（clarity / completeness / accuracy / actionability）。综合分按 `overallScore = AI均分 × 0.8 + 规则通过率 × 10 × 0.2` 加权。不达标时，上一轮的 `quality.issues` 以中文反馈注入下轮 prompt 自动重写，最多重试 `maxRegenerationAttempts` 轮——这是闭环改进，不是简单重试。
+
+`sections/index.ts` 中的 `buildSectionRequirements` 为 10 种章节类型各自硬编码了中文写作规范（quickstart 禁止占位符仓库地址、structure 要求目录树放 `<details>` 折叠块、contributing 不假装存在测试命令），将质量要求前置到 prompt 构造阶段而非仅依赖后置审查。
 
 <details>
-<summary>关于章节写作规范的补充</summary>
+<summary>关于增量更新</summary>
 
-每种章节类型在 `buildSectionRequirements`（`src/generator/sections/index.ts`）中配备独立的中文写作规范，包含具体约束：quickstart 章节禁止出现占位符仓库地址、优先使用项目实际存在的 `scripts` 和 `bin` 名称；structure 章节要求目录树放进 `<details>` 折叠块；contributing 章节要求结合真实 scripts 给出建议且不假装存在测试命令。这些规范以硬编码 `requirements` 字典的形式存在，牺牲了灵活性但确保输出一致性。
+`readme-craft update` 不会全量重新生成。它通过 `buildSnapshot` / `readSnapshot` 生成项目快照，`detectChangedSections`（`src/cli/update.ts`）比对前后差异并映射到章节 ID，只对变更章节重新走生成+审查流程，再由 `mergeReadmeSections` 合并回现有文档。首次 `readme-craft init`，后续只需 `readme-craft update`。
+
+</details>
+
+<details>
+<summary>当前已知限制</summary>
+
+- 仅支持 Node.js / TypeScript 项目扫描（`src/scanner/node.ts`），尚无 Python、Go 等语言的 scanner 实现
+- Mermaid 图表校验（`isValidMermaid`）要求首行必须为 `flowchart TD`、至少 2 个节点和 1 个 subgraph，不支持其他图表类型
+- `collectInsightEvidence` 每个文件只截取前 80 行，深层逻辑可能被截断
+- AI 提供商仅支持 Anthropic Claude 和 OpenAI，`max_tokens` 固定 4096
 
 </details>
 
 ---
 
-## 架构概览
-
-```mermaid
-flowchart LR
-    CLI["src/cli/index.ts"]
-    Init["src/cli/init.ts"]
-    Update["src/cli/update.ts"]
-    Scanner["src/scanner/node.ts"]
-    CliOutput["src/scanner/cli-output.ts"]
-    Comprehension["src/comprehension/index.ts"]
-    Insights["src/insights/index.ts"]
-    Planner["src/planner/index.ts"]
-    Generator["src/generator/index.ts"]
-    Sections["src/generator/sections/index.ts"]
-    Mermaid["src/generator/mermaid.ts"]
-    Reviewer["src/reviewer/index.ts"]
-    Rules["src/reviewer/rules.ts"]
-    Anthropic["src/ai/anthropic.ts"]
-    OpenAI["openai"]
-
-    CLI --> Init
-    CLI --> Update
-    Init --> Scanner
-    Init --> Comprehension
-    Init --> Insights
-    Init --> Planner
-    Init --> Generator
-    Update --> Scanner
-    Update --> Comprehension
-    Update --> Insights
-    Update --> Planner
-    Update --> Generator
-    Scanner --> CliOutput
-    Generator --> Sections
-    Generator --> Mermaid
-    Generator --> Reviewer
-    Reviewer --> Rules
-    Comprehension --> Anthropic
-    Insights --> Anthropic
-    Generator --> Anthropic
-    Anthropic --> OpenAI
-```
-
----
-
 ## 功能特性
 
-1. **五阶段渐进式流水线，非一次性生成。** `readme-craft init` 依次执行：`scanProject`（扫描目录结构、入口点、核心模块、热文件、配置文件）→ `buildProjectUnderstanding`（temperature=0.1，两轮精炼，输出七维 JSON：oneLiner/problem/solution/architecture/keyFeatures/targetAudience/techHighlights）→ `buildProjectInsights`（从入口、热文件、核心模块中采集最多 8 个代码片段，temperature=0.15）→ `planReadmeOutline`（10 种候选章节，inquirer checkbox 交互选择，`-y` 跳过）→ `generateReadmeSections`（逐节生成 + 质量审查循环）。每阶段输出喂给下一阶段，而非把所有信息一次性丢给模型。
+1. **五阶段流水线，不是一次性丢给模型。** `readme-craft init` 串行执行 `scanProject` → `buildProjectUnderstanding`（temperature 0.1，输出 `ProjectUnderstanding` JSON） → `buildProjectInsights`（temperature 0.15，从 entryPoints/hotFiles/coreModules/configurationFiles 四源去重取前 8 个文件、截取前 80 行作为证据） → `planReadmeOutline`（inquirer checkbox 交互选择章节，`-y` 跳过） → `generateReadmeSections`（逐节生成 + 质量审查循环）。每阶段输出类型化 JSON（`ProjectContext → ProjectUnderstanding → InsightsResult → PlannedOutline → GeneratedSection[]`），层间通过 `normalizeUnderstanding` / `normalizeInsights` / `parseJson` 容错校验，任意阶段可独立调试。
 
-2. **双重质量门控 + 闭环重写。** 每个章节生成后经过 `reviewSectionQuality`（`src/reviewer/index.ts`）两层检查：`runRuleChecks` 执行 6 项确定性布尔规则（安装步骤存在性、命令可运行性、代码示例、链接格式、徽章正确性、无占位符——通过正则 `/\[TODO\]|\bTBD\b|your-org|your-username|example-repo/i` 拦截），加上 AI 四维评分（clarity/completeness/accuracy/actionability，各 1-10）。综合分 `overallScore = AI均分 × 0.8 + 规则通过率 × 10 × 0.2`。不达标时，`regenerationHint` 将上一轮 `quality.issues` 拼接为中文反馈注入下一轮 prompt，最多重试 `maxRegenerationAttempts` 轮（默认 2，可在 `.readme-craft.yml` 配置）。
+2. **双轨质量门控 + 闭环重写。** 每个章节生成后经 `reviewSectionQuality`（`src/reviewer/index.ts`）两层检查：`runRuleChecks` 执行 6 项确定性布尔规则（安装步骤存在性、命令可运行性、代码示例、链接格式、徽章正确性、占位符拦截——正则 `/\[TODO\]|\bTBD\b|your-org|your-username|example-repo/i`），`runAIReview` 进行 clarity/completeness/accuracy/actionability 四维 1-10 评分。综合分公式：`overallScore = AI均分 × 0.8 + 规则通过率 × 10 × 0.2`。不达标时将 `quality.issues` 拼接为 `regenerationHint` 注入下轮 prompt（`上一次草稿的问题：...请修正这些问题后重写`），最多重试 `maxRegenerationAttempts` 轮。
 
-3. **增量更新：只重写变更章节。** `readme-craft update` 通过 `buildSnapshot` / `readSnapshot` 生成项目快照，`detectChangedSections`（`src/cli/update.ts`）比对前后快照差异并映射到章节 ID，`updateOutline` 仅启用变更章节，生成后由 `mergeReadmeSections` 精确合并回现有 Markdown。未变更章节原文保留，避免全量重新生成的 token 开销。
+3. **增量更新，只重写变更章节。** `readme-craft update` 通过 `buildSnapshot` / `readSnapshot`（`src/utils/snapshot.ts`）生成项目快照，`detectChangedSections`（`src/cli/update.ts`）比对前后差异映射到章节 ID，仅对变更章节重走生成+审查流程，由 `mergeReadmeSections` 合并回现有 Markdown。未变更章节原文保留，省掉全量重生成的 token 开销。
 
-4. **章节专属 prompt 工程，10 种章节各有独立写作规范。** `buildSectionPrompt`（`src/generator/sections/index.ts`）为每种章节组装不同上下文：quickstart/usage 注入 bin 命令和 CLI 帮助输出，structure 注入目录树和模块导出摘要，api 注入路由端点。`buildSectionRequirements` 为每种章节定义中文约束规则，例如 quickstart 禁止占位符仓库地址、要求优先使用真实 package scripts；structure 要求目录树放进 `<details>` 折叠块、至少指出 3 个核心模块的调用关系。
+4. **10 种章节各有独立 prompt 工程。** `buildSectionPrompt`（`src/generator/sections/index.ts`）按章节类型注入差异化上下文：quickstart/usage 注入 `collectBinCommands` 提取的 bin 命令和 `cliHelpOutput`，structure 注入 `renderDirectoryTree` 和 `summarizeModuleExports`，api 注入 `routeEndpoints`。`buildSectionRequirements` 为每种章节硬编码 2-7 条中文约束规则（quickstart 禁止占位符仓库地址、structure 要求目录树放 `<details>` 折叠块、contributing 不假装存在测试命令）。
 
    <details>
-   <summary>全部 10 种章节 ID</summary>
+   <summary>全部章节 ID 及条件启用逻辑</summary>
 
-   `overview` · `features` · `quickstart` · `usage` · `api` · `configuration` · `structure` · `tech-stack` · `contributing` · `license`
+   基础 8 章节始终包含：`overview` · `features` · `quickstart` · `usage` · `structure` · `tech-stack` · `contributing` · `license`
 
-   其中 `api` 和 `configuration` 根据 `routeEndpoints` / `configurationFiles` 是否存在条件启用。
+   条件章节：当 `context.routeEndpoints` 非空时追加 `api`，当 `context.configurationFiles` 存在时追加 `configuration`。每个条件章节附带 `reason` 字段解释推荐原因。
    </details>
 
-5. **CLI 帮助输出自动捕获与清洗。** `captureCliHelp`（`src/scanner/cli-output.ts`）读取 `package.json` 的 `bin` 字段，通过 `resolveDevEntry` 将 `dist/` 路径映射为 `src/*.ts`，优先尝试 `npx tsx <devEntry> --help`，回退到 `node <distEntry> --help`。输出经 `stripAnsi`（正则 `ANSI_PATTERN`）剥离控制字符后，注入 quickstart 和 usage 章节的生成上下文。
+5. **Mermaid 架构图自动生成与校验。** `generateMermaidDiagram`（`src/generator/mermaid.ts`）调用 LLM（temperature 0.2）生成 `flowchart TD` 图表，要求按逻辑层分 subgraph、最多 15 节点、使用真实模块名。输出经 `sanitizeMermaid` 正则剥离 markdown fence，再由 `isValidMermaid` 校验：首行必须为 `flowchart TD`、至少 2 个节点 ID、至少 1 个 subgraph，`isMermaidKeyword` 过滤 `flowchart/subgraph/end/style/click` 等保留字避免误判节点数。校验不通过直接抛错。
 
-6. **多 AI 提供商，分级 temperature 策略。** 通过 `AIProvider` 接口（`src/ai/provider.ts`）统一 Anthropic 和 OpenAI 调用。`AnthropicProvider`（`src/ai/anthropic.ts`）内部将 system 消息从 messages 数组分离、过滤为 user-only messages 以适配 Anthropic API，`max_tokens` 固定 4096，默认 temperature 0.2。三个阶段使用不同 temperature：理解 0.1、洞察 0.15、生成 0.2。提供商、模型名、API 端点均可通过 `.readme-craft.yml` 或 CLI 选项 `-m` / `-c` 覆盖。
+6. **双 LLM 后端，分级 temperature。** 通过 `createAIProvider` 统一 `AIProvider` 接口（`complete` 方法），支持 Anthropic Claude 和 OpenAI。`AnthropicProvider`（`src/ai/anthropic.ts`）将 system 消息从 messages 数组分离以适配 API，`max_tokens` 固定 4096。三阶段 temperature 递增：comprehension 0.1、insights 0.15、mermaid 0.2。提供商、模型名、API 端点可通过 `.readme-craft.yml` 或 CLI `-m` / `-c` 覆盖，API Key 通过 `dotenv/config` 从 `.env` 加载。
 
 ---
 
 ## 快速开始
 
-需要 Node.js >= 18，npm >= 8。需要至少配置一个 AI 提供商的 API Key（Anthropic 或 OpenAI）。
+需要 Node.js ≥ 18，npm ≥ 8。至少配置一个 LLM API Key（Anthropic 或 OpenAI）。
 
 ```bash
 # 1. 安装依赖并构建
@@ -117,14 +90,19 @@ npm install && npm run build
 cp .env.example .env
 # 编辑 .env，填入 ANTHROPIC_API_KEY 或 OPENAI_API_KEY
 
-# 3. 对目标项目生成 README（-y 跳过交互式章节选择）
-readme-craft init /path/to/target-project -y
-
-# 4. 后续代码变更后，增量更新已有 README
-readme-craft update /path/to/target-project
+# 3. 对当前项目生成 README
+node dist/cli/index.js init
 ```
 
-`init` 执行完整的五阶段流水线（扫描→理解→洞察→规划→生成+审查），首次运行耗时取决于项目规模和 AI 响应速度。`update` 通过快照差异比对只重新生成变更章节，不会全量重写。
+`init` 会依次执行扫描 → 理解 → 洞察 → 规划 → 生成五层管道，中途弹出 inquirer checkbox 让你勾选要生成的章节。加 `-y` 跳过交互直接使用默认章节组合。生成结果同时备份到 `.readme-craft/` 目录，供后续 `update` 命令做差量更新。
+
+对其他目录的项目生成：
+
+```bash
+node dist/cli/index.js init /path/to/target-project
+```
+
+常用选项：`-m` 覆盖模型、`-l en` 切换英文输出、`-o custom-readme.md` 指定输出路径。
 
 以下为实际 CLI 输出：
 
@@ -146,38 +124,39 @@ Commands:
 <details>
 <summary>其他安装方式</summary>
 
-从源码直接运行（不构建）：
+如果 `package.json` 中已配置 bin 字段，可以 link 到全局后直接使用命令名：
 
 ```bash
-npm install
-# 通过 tsx 直接执行 TypeScript 源码
-npm run dev -- init /path/to/target-project -y
-```
-
-构建后通过 node 直接调用入口：
-
-```bash
-npm run build
-node ./dist/cli/index.js init /path/to/target-project
-```
-
-全局链接到系统 PATH（开发调试用）：
-
-```bash
-npm install && npm run build
 npm link
-# 之后可在任意目录使用
-readme-craft init . -y
+readme-craft init
 ```
+
+开发阶段不想每次 build，可以用 `tsx` 直接跑源码：
+
+```bash
+npm run dev -- init /path/to/target-project
+```
+
+`npm run dev` 等价于 `tsx src/cli/index.ts`，后面的参数通过 `--` 透传给 commander。
 
 </details>
 
 <details>
-<summary>配置文件说明</summary>
+<summary>.env 配置说明</summary>
 
-除 `.env` 中的 API Key 外，可在目标项目根目录放置 `.readme-craft.yml` 自定义生成策略。参考仓库中的 `.readme-craft.yml.example`。
+`.env.example` 中列出了两个 key，只需填一个：
 
-CLI 选项可覆盖配置文件：`-c` 指定配置路径，`-m` 指定 AI 模型，`-l` 指定语言，`-o` 指定输出文件名，`-y` 跳过所有交互确认。
+```env
+# 使用 Anthropic Claude
+ANTHROPIC_API_KEY=sk-ant-...
+
+# 或使用 OpenAI
+OPENAI_API_KEY=sk-...
+```
+
+工具通过 `dotenv/config` 自动加载项目根目录的 `.env`。也可以直接设环境变量，不依赖 `.env` 文件。
+
+如果两个 key 都配了，`createAIProvider` 会根据 `-m` 指定的模型名前缀决定使用哪个后端。
 
 </details>
 
@@ -185,54 +164,40 @@ CLI 选项可覆盖配置文件：`-c` 指定配置路径，`-m` 指定 AI 模�
 
 ## 使用示例
 
-### 全量生成 README
+### 为当前项目生成 README
 
 ```bash
 readme-craft init
 ```
 
-在当前目录执行五阶段流水线（扫描→理解→洞察→规划→生成+审查），交互式选择章节后生成完整 README.md。
+默认分析当前目录，语言为中文（`-l zh`），输出到 `README.md`。执行后工具会依次完成项目扫描、LLM 理解、章节规划（交互式 checkbox 让你勾选要生成的章节）、逐章节生成与质量审查，最终写入文件并备份到 `.readme-craft/` 目录。
 
-跳过交互确认：
-
-```bash
-readme-craft init -y
-```
-
-指定目标目录和输出路径：
+### 指定目标目录和模型
 
 ```bash
-readme-craft init ./my-project -o docs/README.zh.md
+readme-craft init ./my-project -m claude-sonnet-4-20250514 -l en -o docs/README.md -y
 ```
 
-### 增量更新 README
+`-y` 跳过章节选择和写入确认，直接按默认 8 章节全量生成。`-o` 控制输出路径。
+
+### 更新已有 README
 
 ```bash
-readme-craft update
+readme-craft update -y
 ```
 
-读取 `.readme-craft-snapshot.json` 快照，比对项目变更，仅重新生成变更章节并合并回现有 README.md。适合持续维护文档。
+`update` 基于 `.readme-craft/` 目录中上次 `init` 的备份做差量更新，而不是从头重新生成。
 
-### 自定义配置
-
-创建 `.readme-craft.yml`：
-
-```yaml
-model: claude-3-5-sonnet-20241022
-language: zh
-outputFile: README.md
-maxRegenerationAttempts: 3
-```
-
-通过 CLI 选项覆盖配置：
+### 开发模式运行（未构建时）
 
 ```bash
-readme-craft init -m gpt-4o -l en -c .readme-craft.custom.yml
+npm run dev -- init ./target-project -y
 ```
 
-### 实际 CLI 输出
+等价于 `tsx src/cli/index.ts init ./target-project -y`，跳过 `tsc` 编译直接执行源码。
 
-以下为 `readme-craft --help` 的实际输出：
+<details>
+<summary>以下为实际 CLI 输出</summary>
 
 ```
 Usage: readme-craft [options] [command]
@@ -249,121 +214,109 @@ Commands:
   help [command]             display help for command
 ```
 
-<details>
-<summary>init 命令选项</summary>
-
-```bash
-readme-craft init --help
-```
-
-- `-c, --config <path>`: 指定配置文件路径
-- `-m, --model <model>`: 覆盖模型名称（如 `claude-3-5-sonnet-20241022` 或 `gpt-4o`）
-- `-l, --language <lang>`: 输出语言，默认 `zh`
-- `-o, --output <file>`: 输出文件路径，默认 `README.md`
-- `-y, --yes`: 跳过最终确认，直接生成
-
 </details>
 
-<details>
-<summary>update 命令选项</summary>
+### 生成结果范围
 
-```bash
-readme-craft update --help
-```
+基于代码可确认的输出内容：
 
-选项与 `init` 一致，但执行增量更新流程：读取快照 → 比对差异 → 仅重新生成变更章节 → 合并回现有文档。
+- 最终产物是一个 Markdown 文件，包含你勾选的章节（基础 8 章节：overview / features / quickstart / usage / structure / tech-stack / contributing / license，如果项目有 `routeEndpoints` 会追加 api 章节，有 `configurationFiles` 会追加 configuration 章节）
+- 每个章节经过 `reviewSectionQuality` 双轨审查（6 项确定性规则 + LLM 四维评分），不达标会自动重试并将问题注入下轮 prompt，重试上限由配置的 `maxRegenerationAttempts` 控制
+- 包含一张 Mermaid `flowchart TD` 架构图，按逻辑层分 subgraph，最多 15 个节点，使用项目真实模块名
+- `.readme-craft/` 目录下会保存本次输出的备份，供后续 `update` 使用
 
-</details>
+### 环境变量
 
-### 典型工作流
-
-1. 项目初始化后执行 `readme-craft init -y` 生成首版 README
-2. 代码变更后执行 `readme-craft update` 增量更新文档
-3. 通过 `.readme-craft.yml` 固化团队配置（模型、语言、输出路径）
-4. CI 流程中集成 `readme-craft update -y` 自动同步文档
+工具通过 `dotenv/config` 自动加载 `.env`。必须配置 LLM 提供商的 API Key（参考 `.env.example`），支持 Anthropic Claude 和 OpenAI 两种后端，通过 `createAIProvider` 统一调度。
 
 ---
 
 ## 项目结构
 
-`src/` 下按职责分为 8 个子模块，数据沿五阶段流水线单向流动：
+readme-craft 采用五层管道架构，数据沿单向链路流动：
 
 ```
-cli (入口) → scanner (扫描) → comprehension (理解) → insights (洞察) → planner (规划) → generator (生成) ↔ reviewer (审查)
-                                                                                              ↓
-                                                                                           ai (调用层)
+scanProject → buildProjectUnderstanding → buildProjectInsights → planReadmeOutline → generateReadmeSections
+     ↓                ↓                          ↓                      ↓                     ↓
+ProjectContext   ProjectUnderstanding       InsightsResult        PlannedOutline       GeneratedSection[]
 ```
 
-`src/cli/index.ts` 是 Commander.js 入口，解析 `init` / `update` 子命令后分别调用 `src/cli/init.ts` 和 `src/cli/update.ts`。两条路径共享同一条流水线，区别在于 `update` 额外执行快照差异比对（`src/utils/snapshot.ts` 中的 `buildSnapshot` / `readSnapshot` / `detectChangedSections`），只重新生成变更章节。
+每层输出类型化 JSON，层间通过 `normalizeUnderstanding`、`normalizeInsights`、`parseJson` 等函数校验和容错修正 LLM 原始输出。`reviewer` 模块不在主链路上，而是被 `generator` 在每个章节生成后调用，形成重试-反馈闭环。`mermaid` 模块同样由 `generator` 阶段触发，独立调用 LLM 生成架构图。
 
-以下是 3 个核心模块的职责边界和调用关系：
+### 核心模块与调用关系
 
-- `src/comprehension/index.ts` — 项目理解层。`buildProjectUnderstanding` 先调用 `scanProject` 的输出构建初始 prompt，以 `temperature=0.1` 请求 AI 返回七维 JSON（oneLiner/problem/solution/architecture/keyFeatures/targetAudience/techHighlights）；随后 `loadEntrySources` 读取入口源码，发起第二轮精炼。输出的 `ProjectUnderstanding` 被下游 insights、planner、generator 三个模块消费。
+`src/comprehension/index.ts` — 管道第一层。通过 `loadEntrySources` 读取实际入口文件源码，构造 prompt 后以 `temperature: 0.1` 调用 LLM，输出 `ProjectUnderstanding` JSON。这是后续所有层的基础输入，insights 和 generator 都依赖它提供的 `oneLiner`、`architecture`、`keyFeatures` 等字段。
 
-- `src/generator/index.ts` + `src/generator/sections/index.ts` — 章节生成层。`generateReadmeSections` 串行遍历 planner 输出的启用章节列表，对每个章节调用 `buildSectionPrompt` 组装章节专属上下文（`buildSectionContext` 根据 `section.id` 动态注入 bin 命令、CLI 帮助输出、目录树、模块导出摘要等不同数据）和中文写作规范（`buildSectionRequirements`，10 种章节各有独立约束）。生成后进入 `reviewSectionQuality` 审查，不达标则将 `quality.issues` 拼接为 `regenerationHint` 注入下一轮 prompt，最多重试 `maxRegenerationAttempts` 轮。
+`src/generator/sections/index.ts` — 章节级 prompt 工厂。`buildSectionContext` 按章节类型注入差异化上下文（quickstart 注入 `collectBinCommands` 提取的 bin 命令和 `cliHelpOutput`，structure 注入 `renderDirectoryTree` 和 `summarizeModuleExports`）。`buildSectionRequirements` 为 10 种章节类型各定义 2-7 条中文生成规则，控制标题格式、折叠块使用、占位符禁止等。这个模块被 `src/generator/index.ts` 的 `generateSingleSection` 调用，是生成质量的前置保障。
 
-- `src/reviewer/index.ts` + `src/reviewer/rules.ts` — 双重质量门控。`runRuleChecks` 执行 6 项确定性布尔检查（安装步骤、可运行性、代码示例、链接有效性、徽章正确性、无占位符），`runAIReview`（`src/reviewer/ai-review.ts`）返回四维 1-10 评分。最终 `overallScore = AI均分 × 0.8 + 规则通过率 × 0.2`。这个模块只被 generator 调用，不直接接触 AI provider 以外的外部状态。
+`src/reviewer/index.ts` + `src/reviewer/rules.ts` — 双轨质量审查。`runRuleChecks` 执行 6 项确定性布尔检查（`hasInstallSteps`、`installStepsRunnable`、`hasCodeExamples`、`linksValid`、`badgesCorrect`、`noPlaceholders`），其中 `noPlaceholders` 使用正则 `/\[TODO\]|\bTBD\b|lorem ipsum|your-org|your-username/i` 拦截常见占位符。`runAIReview` 通过 LLM 进行 clarity/completeness/accuracy/actionability 四维 1-10 评分。最终分数公式：
 
-其余模块的职责：
+```
+overallScore = average(四维评分) * 0.8 + (6项规则通过率) * 10 * 0.2
+```
 
-- `src/ai/` — AI 调用抽象层。`provider.ts` 定义 `AIProvider` 接口，`anthropic.ts` 和 `openai.ts` 分别实现。`AnthropicProvider` 内部将 system 消息从 messages 数组分离，过滤为 user-only messages 以适配 Anthropic API。默认 `max_tokens: 4096`，`temperature: 0.2`。
-- `src/scanner/` — 项目扫描。`index.ts` 扫描目录结构、入口点、核心模块、热文件；`cli-output.ts` 的 `captureCliHelp` 执行项目 bin 命令捕获帮助输出，通过 `ANSI_PATTERN` 正则剥离控制字符，`resolveDevEntry` 将 `dist/` 路径映射为 `src/*.ts`。
-- `src/planner/` — 大纲规划。`buildSections` 构建 10 种候选章节（8 个通用 + api/configuration 按 `routeEndpoints`/`configurationFiles` 条件启用），通过 inquirer checkbox 交互或 `skipPrompt` 跳过。
-- `src/utils/` — 工具函数集合，包括配置加载（`config.ts`）、快照管理（`snapshot.ts`）、Markdown 处理（`markdown.ts`）、JSON 安全解析（`json.ts`）等。
-- `src/types/` — 全局类型定义。
+不达标时 `generator` 将 `quality.issues` 拼接为 `regenerationHint` 注入下轮 prompt，最多重试 `maxRegenerationAttempts` 次。
+
+### 其他关键目录
+
+- `src/scanner/` — 项目静态扫描。`index.ts` 产出 `ProjectContext`，`cli-output.ts` 的 `captureCliHelp` 用正则剥离 ANSI 控制字符（代码中有 `eslint-disable-next-line no-control-regex` 标注）。
+- `src/insights/` — 管道第二层。`collectInsightEvidence` 从 entryPoints/hotFiles/coreModules/configurationFiles 四个来源 `Set` 去重后取前 8 个文件，截取前 80 行作为 LLM 推理证据，`temperature: 0.15`。
+- `src/planner/` — 管道第三层。`buildSections` 始终包含 8 个基础章节，当 `context.routeEndpoints` 非空时追加 api 章节，当 `context.configurationFiles` 存在时追加 configuration 章节，各附 `reason` 字段。支持 inquirer checkbox 交互勾选或 `-y` 跳过。
+- `src/ai/` — LLM 适配层。`provider.ts` 定义 `AIProvider` 接口（`complete` 方法），`anthropic.ts` 和 `openai.ts` 分别实现 Claude 和 OpenAI 后端，通过 `createAIProvider` 统一创建。
+- `src/cli/` — 基于 commander 注册 `init`/`update` 双命令。`init` 串联完整五层管道，末尾通过 `saveLastOutput` 备份到 `.readme-craft/` 目录，为 `update` 提供差量更新基线。
 
 <details>
 <summary>完整目录结构</summary>
 
 ```
 .
-├── .env                          # 环境变量（AI provider key 等）
-├── .env.example
-├── .readme-craft/
-│   └── last-output.txt           # 上次生成的原始输出
-├── .readme-craft.yml             # 项目级配置（模型、语言、输出路径等）
-├── .readme-craft.yml.example
+├── .env.example              # 环境变量模板（LLM API key 等）
+├── .readme-craft/            # 运行时输出备份
+│   ├── last-output.txt       # 上次生成的 README 全文
+│   └── snapshot.json         # 项目快照，供 update 差量比对
+├── .readme-craft.yml         # 项目级配置（模型、语言、输出路径等）
 ├── package.json
 ├── tsconfig.json
 └── src/
     ├── ai/
-    │   ├── provider.ts           # AIProvider 接口定义
-    │   ├── anthropic.ts          # Anthropic 实现（system prompt 分离）
-    │   ├── openai.ts             # OpenAI 实现
-    │   └── index.ts              # createAIProvider 工厂
+    │   ├── provider.ts       # AIProvider 接口定义
+    │   ├── anthropic.ts      # Claude 实现
+    │   ├── openai.ts         # OpenAI 实现
+    │   └── index.ts          # createAIProvider 工厂
     ├── cli/
-    │   ├── index.ts              # Commander.js 入口，注册 init/update
-    │   ├── init.ts               # runInitCommand 全量生成流程
-    │   └── update.ts             # runUpdateCommand 增量更新流程
+    │   ├── index.ts          # commander 程序入口，注册 init/update
+    │   ├── init.ts           # init 命令：串联五层管道
+    │   └── update.ts         # update 命令：基于 snapshot 差量更新
     ├── comprehension/
-    │   ├── index.ts              # buildProjectUnderstanding（两轮精炼）
-    │   └── prompts.ts            # 理解阶段的 prompt 模板
-    ├── generator/
-    │   ├── index.ts              # generateReadmeSections + 重试循环
-    │   ├── mermaid.ts            # Mermaid 图生成 / sanitize / validate
-    │   └── sections/             # buildSectionPrompt / buildSectionContext / buildSectionRequirements
+    │   ├── index.ts          # buildProjectUnderstanding（temperature 0.1）
+    │   └── prompts.ts        # initialUnderstandingPrompt 模板
     ├── insights/
-    │   └── index.ts              # buildProjectInsights + collectInsightEvidence（最多 8 片段）
+    │   └── index.ts          # buildProjectInsights + collectInsightEvidence
     ├── planner/
-    │   └── index.ts              # planReadmeOutline + inquirer 交互
+    │   └── index.ts          # planReadmeOutline + buildSections 动态章节组装
+    ├── generator/
+    │   ├── index.ts          # generateReadmeSections + 重试反馈循环
+    │   ├── mermaid.ts        # generateMermaidDiagram + sanitize/validate
+    │   └── sections/
+    │       └── index.ts      # 10 种章节的 context 注入 + requirements 规则
     ├── reviewer/
-    │   ├── index.ts              # reviewSectionQuality（加权合成 overallScore）
-    │   ├── rules.ts              # runRuleChecks（6 项确定性检查）
-    │   └── ai-review.ts          # runAIReview（4 维 AI 评分）
+    │   ├── index.ts          # reviewSectionQuality 双轨评分 + overallScore
+    │   ├── rules.ts          # 6 项确定性布尔规则检查
+    │   └── ai-review.ts      # LLM 四维评分
     ├── scanner/
-    │   ├── index.ts              # scanProject 主扫描逻辑
-    │   ├── cli-output.ts         # captureCliHelp + ANSI 清洗
-    │   └── node.ts               # Node.js 项目特定扫描
+    │   ├── index.ts          # scanProject → ProjectContext
+    │   ├── node.ts           # Node.js 项目特化扫描逻辑
+    │   └── cli-output.ts     # captureCliHelp + ANSI 剥离
     ├── types/
-    │   └── index.ts              # 全局类型（ProjectContext, QualityCheck 等）
+    │   └── index.ts          # 全部类型定义（ProjectContext 等）
     └── utils/
-        ├── config.ts             # loadConfig（.readme-craft.yml + CLI 选项合并）
-        ├── snapshot.ts           # buildSnapshot / readSnapshot / detectChangedSections
-        ├── markdown.ts           # mergeReadmeSections / upsertArchitectureSection
-        ├── fs.ts                 # safeReadFile / resolveReadmePath
-        ├── json.ts               # 安全 JSON 解析
-        ├── log.ts                # 日志工具
-        └── project-type.ts       # 项目类型推断
+        ├── config.ts         # loadConfig 读取 .readme-craft.yml
+        ├── fs.ts             # 文件系统工具
+        ├── json.ts           # parseJson 容错解析
+        ├── log.ts            # 日志工具
+        ├── markdown.ts       # renderReadme + renderDirectoryTree
+        ├── project-type.ts   # 项目类型推断
+        └── snapshot.ts       # saveLastOutput + snapshot 管理
 ```
 
 </details>
@@ -372,63 +325,54 @@ cli (入口) → scanner (扫描) → comprehension (理解) → insights (洞�
 
 ## 配置说明
 
-readme-craft 的配置分三层：环境变量（`.env`）、项目配置文件（`.readme-craft.yml`）、CLI 选项。优先级从低到高：`.readme-craft.yml` < `.env` < CLI 选项。
+readme-craft 的配置分两层：环境变量（`.env`）控制 LLM 后端认证，CLI 参数控制单次运行行为。项目通过 `dotenv/config` 在启动时自动加载工作目录下的 `.env` 文件。
 
 ### 环境变量
 
-项目根目录创建 `.env` 文件（参考 `.env.example`）：
+项目根目录提供了 `.env.example` 作为模板：
 
-```bash
-# 二选一，取决于你使用哪个 AI 提供商
+```dotenv
+# 使用 OpenAI 时需要
 OPENAI_API_KEY=
+
+# 使用 Anthropic 时需要
 ANTHROPIC_API_KEY=
 ```
 
-CLI 入口（`src/cli/index.ts`）启动时通过 `dotenv` 加载这些变量。`createAIProvider`（`src/ai/index.ts`）根据当前选择的提供商读取对应的 key：
+两个 key 只需配一个。`createAIProvider` 根据你提供的 key 决定调用哪个后端。如果两个都设了，具体优先级取决于 `createAIProvider` 的实现逻辑（建议只保留你要用的那个，避免歧义）。
 
-- 选择 Anthropic → 读 `ANTHROPIC_API_KEY`，由 `AnthropicProvider`（`src/ai/anthropic.ts`）使用，默认 `max_tokens: 4096`，`temperature: 0.2`
-- 选择 OpenAI → 读 `OPENAI_API_KEY`，由 `OpenAIProvider`（`src/ai/openai.ts`）使用
+这两个变量影响的是整条管道中所有 LLM 调用——comprehension（temperature 0.1）、insights（temperature 0.15）、generator、reviewer 的 AI 评分、mermaid 图表生成，全部走同一个 provider。
 
-没有设置对应 key 时，AI 调用阶段会直接报错。两个 key 都设置的情况下，由 `-c` 选项或 `.readme-craft.yml` 中的提供商配置决定使用哪个。
+### CLI 参数
 
-### 项目配置文件
+基于 commander 注册的 `init` 和 `update` 两个命令，支持以下选项：
 
-`.readme-craft.yml` 放在项目根目录。仓库中有 `.readme-craft.yml.example` 作为参考模板。
+| 参数 | 作用 | 影响的流程 |
+|------|------|-----------|
+| `-c <path>` | 指定配置文件路径 | 项目扫描阶段的输入源 |
+| `-m <model>` | 覆盖默认模型 | 所有 LLM 调用使用的模型标识 |
+| `-l <lang>` | 输出语言，默认 `zh` | sections/index.ts 中章节生成规则和 prompt 的语言切换 |
+| `-o <path>` | 输出文件路径 | renderReadme 写入的目标文件 |
+| `-y` | 跳过确认，不弹出 inquirer checkbox | planner 层直接使用 buildSections 的默认章节组合 |
 
-配置通过 `loadConfig` 函数加载，影响以下流程：
+示例：
 
-| CLI 选项 | 作用 | 影响的流程阶段 |
-|---------|------|--------------|
-| `-c` | AI 提供商选择 | `createAIProvider` 工厂决定实例化 Anthropic 还是 OpenAI |
-| `-m` | 模型名称 | 传入 AI 调用的 model 参数，贯穿理解、洞察、生成、审查全部阶段 |
-| `-l` | 输出语言 | 影响 `buildSectionPrompt` 中的写作规范和 prompt 语言 |
-| `-o` | 输出文件路径 | 最终 Markdown 写入的目标路径，默认行为是写入 `README.md` |
-| `-y` | 跳过交互确认 | `planReadmeOutline` 中跳过 inquirer checkbox，直接使用默认启用的章节 |
+```bash
+# 用 Anthropic 后端，中文输出，跳过交互确认
+ANTHROPIC_API_KEY=sk-xxx npx readme-craft init -l zh -y
 
-CLI 选项会覆盖 `.readme-craft.yml` 中的同名配置。
+# 指定模型和输出路径
+npx readme-craft init -m claude-sonnet-4-20250514 -o docs/README.md
+```
+
+### 生成产物与备份
+
+`init` 完成后会调用 `saveLastOutput` 将本次生成结果备份到 `.readme-craft/` 目录。`update` 命令依赖这个备份作为差量更新的基线。如果你删了 `.readme-craft/`，`update` 将无法正常工作。
+
+建议在 `.gitignore` 中保留 `.readme-craft/`（项目已默认忽略），但不要手动删除它。
 
 <details>
-<summary>关于 .readme-craft.yml 的已知限制</summary>
-
-`.readme-craft.yml` 的完整字段列表需要查看 `loadConfig` 的实现源码确认。从 CLI 选项和代码流程可以确认上述五个维度的配置是支持的，但 yml 文件中是否有额外字段（如 `maxRegenerationAttempts`、章节启用/禁用列表等），需要参考 `.readme-craft.yml.example` 或阅读 `loadConfig` 源码。
-
-</details>
-
-### AI 调用参数
-
-不同流水线阶段使用不同的 temperature，这是硬编码的设计取舍，不通过配置文件暴露：
-
-| 阶段 | 模块 | temperature | 原因 |
-|------|------|------------|------|
-| 项目理解 | `src/comprehension/index.ts` | 0.1 | 结构化 JSON 输出需要高确定性 |
-| 洞察提取 | `src/insights/index.ts` | 0.15 | 允许轻微发散以发现代码模式 |
-| 章节生成 | `src/generator/index.ts` | 0.2 | 平衡可读性与准确性 |
-
-这些值不可通过配置修改。如果需要调整，直接改源码。
-
-### TypeScript 编译配置
-
-`tsconfig.json` 使用 `NodeNext` 模块系统，编译目标 ES2022：
+<summary>tsconfig.json 编译配置</summary>
 
 ```jsonc
 {
@@ -446,72 +390,66 @@ CLI 选项会覆盖 `.readme-craft.yml` 中的同名配置。
 }
 ```
 
-开启了 `noUncheckedIndexedAccess` 和 `exactOptionalPropertyTypes`，这意味着贡献代码时所有索引访问需要处理 `undefined`，可选属性不能赋值 `undefined`（除非类型显式包含）。
+开启了 `noUncheckedIndexedAccess` 和 `exactOptionalPropertyTypes`，这意味着如果你要改源码，数组/对象索引访问需要处理 `undefined`，可选属性不能赋值 `undefined`（除非类型显式包含）。编译产物输出到 `dist/`，CLI 入口为 `dist/cli/index.js`。
 
-构建命令：
+</details>
 
-```bash
-npm run build    # tsc -p tsconfig.json → 输出到 dist/
-npm run check    # tsc --noEmit 仅类型检查
-npm run dev      # tsx src/cli/index.ts 直接运行源码
-```
+### 不在配置范围内的东西
 
-`captureCliHelp`（`src/scanner/cli-output.ts`）在捕获 CLI 帮助输出时，会通过 `resolveDevEntry` 将 `dist/` 路径映射回 `src/` 的 `.ts` 文件，优先用 `npx tsx` 执行。所以开发阶段不需要先 build 也能正常运行 `init`/`update`。
+以下行为是硬编码的，不能通过配置修改：
+
+- 各层 temperature 值（comprehension 0.1、insights 0.15）
+- `collectInsightEvidence` 取前 8 个文件、每文件截取前 80 行
+- mermaid 图表最多 15 节点的限制
+- reviewer 的 `overallScore` 加权公式（AI 评分均值 × 0.8 + 规则通过率 × 10 × 0.2）
+- `maxRegenerationAttempts` 的重试次数上限
+
+如果需要调整这些参数，目前只能改源码。
 
 ---
 
 ## 技术栈
 
-TypeScript 编写，编译目标和模块系统由 `tsconfig.json` 控制，`tsc -p tsconfig.json` 构建到 `dist/`，开发时通过 `tsx src/cli/index.ts` 直接运行源码跳过编译。项目无测试框架、无 bundler，构建链路只有 `tsc`。
+TypeScript 全栈，运行在 Node.js 上，编译目标由 `tsconfig.json` 控制，构建命令 `tsc -p tsconfig.json`，开发时用 `tsx` 直接执行 TS 源码（`npm run dev` → `tsx src/cli/index.ts`）。
 
-运行时依赖 7 个，各自职责明确：
+运行时依赖分三类：
 
-- `commander` ^14.0.0 — CLI 入口框架，`src/cli/index.ts` 用它注册 `init` 和 `update` 两个子命令及 `-c/-m/-l/-o/-y` 等选项
-- `@anthropic-ai/sdk` ^0.79.0 — `src/ai/anthropic.ts` 中 `AnthropicProvider` 调用 Anthropic Messages API，内部将 system 消息从 messages 数组分离、过滤为 user-only messages 以适配其 API 约束，默认 `max_tokens: 4096`，`temperature` 默认 0.2
-- `openai` ^5.12.2 — `src/ai/openai.ts` 中实现 `OpenAIProvider`，与 `AnthropicProvider` 共享 `AIProvider` 接口，通过 `createAIProvider` 工厂按配置切换
-- `dotenv` ^17.3.1 — 加载 `.env` 文件中的 API 密钥和配置，在 CLI 入口早期调用
-- `js-yaml` ^4.1.0 — 解析 `.readme-craft.yml` 配置文件（`loadConfig`），支持用户自定义生成策略、输出路径、语言等
-- `inquirer` ^12.9.6 — `src/planner/index.ts` 中用 checkbox 类型交互让用户选择启用哪些 README 章节，`-y` 跳过时不调用
-- `simple-git` ^3.28.0 — `update` 流程中用于快照比对相关的 git 操作，支撑 `buildSnapshot`/`readSnapshot` 的增量更新机制
+- LLM 通信：`@anthropic-ai/sdk` 和 `openai` 两个 SDK 并存，通过 `createAIProvider` 统一为 `AIProvider` 接口（只暴露 `complete` 方法），各管道层按需传入不同 `temperature`（comprehension 0.1、insights 0.15、mermaid 0.2）。切换后端只需改 `.env` 中的 provider 配置，不动业务代码。
+- CLI 框架：`commander` 注册 `init` / `update` 两个子命令及其选项（`-c` 配置路径、`-m` 模型覆盖、`-l` 语言、`-o` 输出路径、`-y` 跳过确认）；`inquirer` 负责交互式 checkbox（章节勾选）和 confirm 提示（写入确认）。
+- 工具库：`dotenv` 在 CLI 入口自动加载 `.env`；`js-yaml` 解析 YAML 格式的配置文件；`simple-git` 用于读取 Git 仓库信息（供 scanner 层构建项目上下文）。
 
-开发依赖 4 个：`typescript` ^5.9.3 负责类型检查和编译；`tsx` ^4.20.5 用于 `npm run dev` 直接执行 `.ts` 源码，也被 `captureCliHelp` 在运行时通过 `npx tsx` 执行目标项目的 TypeScript 入口；`@types/node` ^24.5.2 和 `@types/js-yaml` ^4.0.9 提供类型定义。
-
-AI 调用在不同阶段使用分级 temperature：项目理解 `buildProjectUnderstanding` 用 0.1，洞察提取 `buildProjectInsights` 用 0.15，章节内容生成和 Mermaid 图生成用 0.2。所有 AI 调用通过 `AIProvider` 接口统一，切换提供商不影响上层流水线逻辑。
-
-项目不依赖任何前端框架、ORM 或 HTTP 服务端库——它是纯 CLI 工具，`src/` 下按职责分为 `ai`、`cli`、`comprehension`、`insights`、`planner`、`generator`、`reviewer`、`scanner` 八个子模块。
+开发工具链只有三样：`typescript` 编译器（`tsc --noEmit` 做类型检查）、`tsx` 免编译执行、`@types/node` 和 `@types/js-yaml` 提供类型定义。没有 bundler，没有测试框架，没有 linter 配置——当前质量门槛靠 `tsc --noEmit`（`npm run check`）守住。
 
 <details>
 <summary>依赖清单</summary>
 
-| 类型 | 包名 | 版本 | 项目中的用途 |
-|------|------|------|-------------|
-| runtime | `@anthropic-ai/sdk` | ^0.79.0 | `AnthropicProvider`，Anthropic Messages API 调用，system prompt 分离 |
-| runtime | `commander` | ^14.0.0 | CLI 命令注册（init/update）、选项解析 |
-| runtime | `dotenv` | ^17.3.1 | 加载 `.env` 中的 API 密钥和环境变量 |
-| runtime | `inquirer` | ^12.9.6 | 交互式 checkbox 选择 README 章节 |
-| runtime | `js-yaml` | ^4.1.0 | 解析 `.readme-craft.yml` 配置文件 |
-| runtime | `openai` | ^5.12.2 | `OpenAIProvider`，OpenAI API 调用 |
-| runtime | `simple-git` | ^3.28.0 | 增量更新的 git 快照比对 |
-| dev | `typescript` | ^5.9.3 | 编译（`npm run build`）和类型检查（`npm run check`） |
-| dev | `tsx` | ^4.20.5 | 开发运行（`npm run dev`）、运行时 CLI 输出捕获 |
-| dev | `@types/node` | ^24.5.2 | Node.js 类型定义 |
-| dev | `@types/js-yaml` | ^4.0.9 | js-yaml 类型定义 |
+| 包名 | 版本 | 类别 | 在项目中的职责 |
+|---|---|---|---|
+| `@anthropic-ai/sdk` | ^0.79.0 | 运行时 | Anthropic Claude API 调用，comprehension/insights/generator/mermaid 各层通过 AIProvider 接口使用 |
+| `openai` | ^5.12.2 | 运行时 | OpenAI API 调用，与 Anthropic SDK 通过 createAIProvider 统一抽象 |
+| `commander` | ^14.0.0 | 运行时 | CLI 命令注册与参数解析（init/update 子命令及 -c/-m/-l/-o/-y 选项） |
+| `inquirer` | ^12.9.6 | 运行时 | 交互式 checkbox 选择章节、confirm 确认写入 |
+| `dotenv` | ^17.3.1 | 运行时 | 自动加载 `.env` 文件中的 API 密钥和配置 |
+| `js-yaml` | ^4.1.0 | 运行时 | 解析 YAML 格式的项目配置文件 |
+| `simple-git` | ^3.28.0 | 运行时 | 读取 Git 仓库元信息供 scanner 层构建 ProjectContext |
+| `typescript` | ^5.9.3 | 开发 | 编译 TS 源码（`npm run build`）和类型检查（`npm run check`） |
+| `tsx` | ^4.20.5 | 开发 | 开发阶段免编译直接执行 TS（`npm run dev`） |
+| `@types/node` | ^24.5.2 | 开发 | Node.js API 类型定义 |
+| `@types/js-yaml` | ^4.0.9 | 开发 | js-yaml 类型定义 |
 
 </details>
+
+值得注意的取舍：项目没有引入 `langchain` 或类似的 LLM 编排框架，而是自己实现了五层管道和重试逻辑。好处是零额外抽象开销，每层的 prompt 构造、temperature 选择、输出校验都可以精确控制；代价是新增 LLM 后端需要手动实现 `AIProvider` 接口适配。
 
 ---
 
 ## 贡献指南
 
-欢迎提交 PR。项目当前为单人维护，接受功能增强和 bug 修复。
+readme-craft 目前是单人维护项目，欢迎提交 Issue 和 PR。
 
-基本质量要求：
+质量底线：PR 必须通过 `npm run check`（TypeScript 类型检查），不能引入新的类型错误。项目当前没有测试框架和测试命令，唯一的自动化质量门槛就是 `tsc --noEmit`。
 
-- PR 必须通过 `npm run check`（`tsc --noEmit`），不允许引入类型错误
-- 代码遵循现有模块边界：`src/` 下按 `ai/cli/comprehension/insights/planner/generator/reviewer/scanner` 八个子模块组织，新功能放进对应模块，不要在模块间制造循环依赖
-- 如果你修改了章节生成逻辑（`src/generator/sections/`），确认 `buildSectionRequirements` 中的中文写作规范同步更新
-- 如果你新增 AI Provider，实现 `src/ai/provider.ts` 中的 `AIProvider` 接口，并在 `createAIProvider` 工厂中注册
-- 项目当前没有测试框架和测试命令。质量门槛仅有 TypeScript 类型检查（`npm run check`）。如果你愿意引入测试框架，这本身就是一个值得提交的 PR
+代码风格跟随现有模块的写法，不需要额外配置 linter。提交信息用中文或英文均可，说清楚改了什么就行。
 
 <details>
 <summary>开发流程细节</summary>
@@ -519,64 +457,60 @@ AI 调用在不同阶段使用分级 temperature：项目理解 `buildProjectUnd
 ### 环境准备
 
 ```bash
-git clone <your-fork>
+git clone <your-fork-url>
 cd readme-craft
 npm install
 cp .env.example .env
-# 在 .env 中填入 ANTHROPIC_API_KEY 或 OPENAI_API_KEY
+# 在 .env 中填入 Anthropic 或 OpenAI 的 API Key
 ```
 
-### 日常开发
+### 可用的 npm scripts
+
+| 命令 | 作用 |
+|---|---|
+| `npm run dev` | 通过 `tsx src/cli/index.ts` 直接运行 CLI，不需要先编译 |
+| `npm run check` | `tsc --noEmit`，只做类型检查，不产出文件 |
+| `npm run build` | `tsc -p tsconfig.json`，编译到 `dist/` |
+
+开发时用 `npm run dev -- init` 或 `npm run dev -- update` 直接跑 CLI 命令，不需要反复 build。
+
+### 项目结构与改动指引
+
+改动前先确认你要动的是哪一层：
+
+- `src/scanner/` — 项目扫描，产出 `ProjectContext`
+- `src/comprehension/` — LLM 理解层，产出 `ProjectUnderstanding`
+- `src/insights/` — 证据收集 + LLM 洞察，产出 `InsightsResult`
+- `src/planner/` — 章节规划，产出 `PlannedOutline`
+- `src/generator/` — 章节生成 + Mermaid 图表
+- `src/reviewer/` — 双轨质量审查（规则检查 + LLM 评分）
+- `src/cli/` — commander 命令注册（init / update）
+- `src/types/index.ts` — 所有层间数据结构的类型定义
+
+层间数据流是单向的：`ProjectContext → ProjectUnderstanding → InsightsResult → PlannedOutline → GeneratedSection[]`。如果你要改某一层的输出结构，先改 `src/types/index.ts` 里对应的类型，然后 `npm run check` 会告诉你哪些下游消费方需要同步更新。
+
+### 章节生成规则
+
+如果你想新增或修改某个章节的生成行为，改 `src/generator/sections/index.ts`。每个章节类型在 `buildSectionRequirements` 中有独立的中文规则集（2-7 条），在 `buildSectionContext` 中有独立的上下文注入逻辑。新增章节类型还需要在 `src/planner/` 的 `buildSections` 中注册，并设置触发条件和 `reason` 字段。
+
+### Mermaid 模块
+
+`src/generator/mermaid.ts` 有独立的校验链：`sanitizeMermaid`（剥离 markdown fence）→ `isValidMermaid`（首行声明 + ≥2 节点 + ≥1 subgraph）。改动后用实际项目跑一次 `npm run dev -- init` 确认生成的图表能在 GitHub 上渲染。
+
+### reviewer 评分公式
+
+`overallScore = 四维 LLM 评分均值 × 0.8 + 规则通过率 × 10 × 0.2`
+
+6 项确定性规则在 `src/reviewer/rules.ts`，包括 `noPlaceholders` 的正则检测。如果你要加新规则，加在 `runRuleChecks` 里，权重会自动参与计算。
+
+### 提交 PR 前
 
 ```bash
-# 直接通过 tsx 运行源码，不需要先 build
-npm run dev -- init          # 等价于 tsx src/cli/index.ts init
-npm run dev -- update        # 增量更新模式
-npm run dev -- init -y       # 跳过 inquirer 交互式章节选择
+npm run check   # 必须通过，零错误
+npm run build   # 确认能编译
 ```
 
-### 提交前检查
-
-```bash
-npm run check    # tsc --noEmit，确认无类型错误
-npm run build    # tsc -p tsconfig.json，确认能正常编译到 dist/
-```
-
-这是目前仅有的两道自动化质量门槛。没有 lint 命令，没有单元测试。手动验证时建议至少跑一次 `npm run dev -- init -y` 确认端到端流程不报错。
-
-### 关键文件与修改指引
-
-| 你想改的功能 | 入手文件 | 注意事项 |
-|---|---|---|
-| 新增/修改章节类型 | `src/generator/sections/index.ts` | 同步更新 `buildSectionRequirements` 和 `src/planner/index.ts` 中的候选章节列表 |
-| 调整质量审查规则 | `src/reviewer/index.ts` | `runRuleChecks` 是确定性规则，`overallScore` 加权公式为 `AI均分×0.8 + 规则通过率×0.2` |
-| 新增 AI Provider | `src/ai/provider.ts` → 实现接口 → `src/ai/index.ts` 注册工厂 | 参考 `src/ai/anthropic.ts` 中 system prompt 分离的处理方式 |
-| 修改项目扫描逻辑 | `src/scanner/` | `captureCliHelp` 在 `src/scanner/cli-output.ts`，注意 ANSI 清洗正则 |
-| 增量更新逻辑 | `src/cli/update.ts` | `detectChangedSections` 依赖快照比对，`mergeReadmeSections` 做章节级合并 |
-
-### 数据流概览
-
-修改任何阶段前，理解上下游依赖：
-
-```
-scanProject → buildProjectUnderstanding (temp=0.1)
-                    ↓
-            buildProjectInsights (temp=0.15, ≤8 代码片段)
-                    ↓
-            planReadmeOutline (inquirer 交互)
-                    ↓
-            generateReadmeSections (temp=0.2, 逐节串行)
-                    ↓ 每节循环
-            reviewSectionQuality → 不达标 → regenerationHint 注入 issues → 重新生成
-```
-
-每阶段的输出是下一阶段的输入。如果你修改了 `buildProjectUnderstanding` 的输出结构（七维 JSON），下游 `buildProjectInsights`、`buildSectionPrompt` 都会受影响。
-
-### 配置文件
-
-- `.env`：AI API 密钥
-- `.readme-craft.yml`：生成策略配置，参考 `.readme-craft.yml.example`
-- `tsconfig.json`：TypeScript 编译配置
+没有自动化测试，所以请在 PR 描述中说明你用什么项目实际跑过 `init` 或 `update`，贴一下关键输出片段。
 
 </details>
 
@@ -586,17 +520,17 @@ scanProject → buildProjectUnderstanding (temp=0.1)
 
 本项目基于 [MIT License](./LICENSE) 发布。
 
-readme-craft 自身代码（`src/` 下全部 TypeScript 源码）及生成的 CLI 产物（`dist/cli/index.js`）均适用 MIT 许可。你用 readme-craft 生成的 README 文档归你所有，不受本项目许可证约束。
+你可以自由使用、修改、分发本项目代码，包括用于商业用途，只需保留原始版权声明。
 
 <details>
-<summary>关于依赖项的许可证说明</summary>
+<summary>第三方依赖许可证说明</summary>
 
-readme-craft 的运行时依赖包括 `commander`、`inquirer`、`@anthropic-ai/sdk`、`openai` 等 npm 包，各自遵循其独立许可证。部署或分发时请通过以下命令自行确认依赖许可证兼容性：
+readme-craft 运行时依赖 `commander`、`inquirer`、`dotenv` 等 npm 包，各依赖遵循其自身许可证条款。运行以下命令可查看完整依赖许可证清单：
 
 ```bash
 npx license-checker --summary
 ```
 
-当前已知的运行时依赖均为 MIT 或 Apache-2.0 兼容许可，但本项目不对第三方依赖的许可证变更承担担保责任。
+本项目调用 Anthropic Claude 和 OpenAI API 生成内容，生成产物的使用需同时遵守对应 API 提供商的服务条款。
 
 </details>
